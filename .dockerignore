@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log
+yarn-error.log
+
+apps/api/node_modules
+apps/web/node_modules
+packages/shared/node_modules
+
+apps/api/dist
+apps/web/dist
+packages/shared/dist
+
+.git
+.env
+.DS_Store

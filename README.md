@@ -119,10 +119,58 @@ curl -X POST http://localhost:3000/jobs \
   -d '{"title":"Test job","type":"demo"}'
 ```
 
-## Deployment
+## Production Deployment Scope (VPS)
 
-- **Backend**: Railway or Render — set `DATABASE_URL`, `DIRECT_URL`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` as env vars.
-- **Frontend**: Vercel or Netlify — set `VITE_API_URL` to the deployed backend URL.
+To deploy this application to a production Virtual Private Server (VPS) like AWS EC2, DigitalOcean Droplet, or Hetzner:
+
+### 1. Process Management (PM2)
+Use PM2 to run both the NestJS backend and the Vite static server (or serve frontend via Nginx directly).
+```bash
+# Start backend
+pm2 start dist/main.js --name api-server
+
+# For frontend, build it first
+yarn workspace web build
+# Serve static files with PM2 or Nginx
+```
+
+### 2. Reverse Proxy (Nginx)
+Configure Nginx to route traffic to your frontend and backend securely, handling SSL termination.
+
+```nginx
+server {
+    listen 80;
+    server_name yourdomain.com;
+
+    # Route /api to NestJS backend
+    location /api/ {
+        proxy_pass http://localhost:3000/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+        
+        # Forward Proxy / Real IP headers
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Serve React Frontend directly
+    location / {
+        root /path/to/job-queue-dashboard/apps/web/dist;
+        index index.html index.htm;
+        try_files $uri $uri/ /index.html;
+    }
+}
+```
+
+### 3. Production Security Features
+- **Helmet**: Adds 14+ HTTP security headers (X-Frame-Options, X-XSS-Protection, Strict-Transport-Security, etc.) to the NestJS API.
+- **CORS**: Configured in `main.ts` to only allow requests from the designated frontend production domain.
+- **Rate Limiting**: `@nestjs/throttler` is installed and configured in `app.module.ts` to limit abuse (100 requests / minute / IP).
+- **SSL/TLS**: Use Let's Encrypt / Certbot on the Nginx reverse proxy to secure all traffic.
 
 ## Assumptions and Trade-offs
 

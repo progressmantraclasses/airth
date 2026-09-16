@@ -64,9 +64,9 @@ export default function App() {
             Settings
           </button>
           <div className="sidebar-profile">
-            <div className="profile-avatar">MR</div>
+            <div className="profile-avatar">ST</div>
             <div className="profile-info">
-              <div className="profile-name">Madhur Rastogi</div>
+              <div className="profile-name">Shivam Tiwari</div>
               <div className="profile-role">Admin Workspace</div>
             </div>
           </div>
@@ -99,8 +99,8 @@ export default function App() {
               <span className="notif-dot"></span>
             </button>
             <div className="header-user-pill">
-              <div className="user-avatar">MR</div>
-              <span className="user-name">Madhur Rastogi</span>
+              <div className="user-avatar">ST</div>
+              <span className="user-name">Shivam Tiwari</span>
               <svg className="chevron-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
             </div>
           </div>
