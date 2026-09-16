@@ -2,125 +2,230 @@
 
 **Live Demo:** [https://airth-web-pi.vercel.app/](https://airth-web-pi.vercel.app/)
 
-A robust monorepo containing a NestJS REST API and a React frontend for managing background jobs with state machine validation and strict concurrency safety.
+A monorepo containing a NestJS REST API and a React frontend for managing background jobs with state machine validation and concurrency safety.
 
----
-
-## 🛠️ Tech Stack
+## Stack
 
 - **Backend**: NestJS, Prisma, PostgreSQL (Supabase), Upstash Redis
 - **Frontend**: React 18, Vite, TanStack Query
-- **Shared**: TypeScript workspace package for unified type definitions and state transitions.
-- **Monorepo Management**: Yarn Classic (v1) workspaces
+- **Shared**: TypeScript package with `JobStatus` enum and `canTransition` helper
+- **Monorepo**: Yarn Classic (v1) workspaces
 
----
+## Setup
 
-## 🚀 Setup Instructions (Step-by-Step)
+## Step-by-Step Setup Guide
 
-Follow these steps to run the project locally on your machine.
+This project requires two external services: **Supabase** (for the PostgreSQL database) and **Upstash** (for Serverless Redis caching and locking). Both have generous free tiers that don't require a credit card.
 
-### Prerequisites
-- Node.js (v18 or higher)
-- Yarn classic (`npm install -g yarn`)
-- A Supabase account (for PostgreSQL)
-- An Upstash account (for Redis)
+### 1. Database Setup (Supabase)
+1. Go to [Supabase](https://supabase.com/) and create a new project.
+2. Once created, go to **Project Settings -> Database**.
+3. Under **Connection string -> URI**, copy your PostgreSQL connection string.
+4. Note that for Prisma, you need two connection strings: one for connection pooling (`DATABASE_URL`) and one direct connection for migrations (`DIRECT_URL`).
 
-### 1. Install Dependencies
-Navigate to the root directory and install dependencies across all workspaces:
+### 2. Redis Setup (Upstash)
+1. Go to [Upstash](https://upstash.com/) and create a new Redis database.
+2. Scroll down to the **REST API** section of your database dashboard.
+3. Copy the `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+
+### 3. Local Environment Configuration
+Clone the repository and install dependencies:
 ```bash
+git clone https://github.com/progressmantraclasses/airth.git
+cd airth
 yarn install
 ```
 
-### 2. Configure Environment Variables
-You need to set up the environment variables for both the backend API and the frontend web app.
+Set up your environment variables by copying the example files:
 ```bash
-# Setup Backend ENV
 cp apps/api/.env.example apps/api/.env
-
-# Setup Frontend ENV
 cp apps/web/.env.example apps/web/.env
 ```
-Open `apps/api/.env` and fill in your actual credentials:
-- `DATABASE_URL` (Supabase connection string with `?pgbouncer=true`)
-- `DIRECT_URL` (Supabase direct connection string)
-- `UPSTASH_REDIS_REST_URL` & `UPSTASH_REDIS_REST_TOKEN` (From Upstash console)
 
-### 3. Database Migration & Seeding
-Initialize the database schema and seed it with sample jobs:
+Open `apps/api/.env` and fill in the credentials you grabbed from Supabase and Upstash:
+```env
+DATABASE_URL="postgresql://postgres.[YOUR-REF]:[PASSWORD]@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?pgbouncer=true"
+DIRECT_URL="postgresql://postgres.[YOUR-REF]:[PASSWORD]@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
+
+UPSTASH_REDIS_REST_URL="https://[YOUR-UPSTASH-URL].upstash.io"
+UPSTASH_REDIS_REST_TOKEN="[YOUR-UPSTASH-TOKEN]"
+```
+
+### 4. Database Migrations & Seeding
+Push the database schema to Supabase and seed it with sample data:
 ```bash
 cd apps/api
 npx prisma migrate dev --name init
 npx prisma db seed
+cd ../..
 ```
 
-### 4. Start the Application
-Return to the root directory. You can run the backend and frontend simultaneously in separate terminal windows:
+### 5. Running the Application
+You can run the backend and frontend simultaneously using two terminal windows:
 
 **Terminal 1 (Backend API):**
 ```bash
 yarn dev:api
-# API runs on http://localhost:3000
+# API will start on http://localhost:3000
 ```
 
-**Terminal 2 (Frontend Web):**
+**Terminal 2 (Frontend Dashboard):**
 ```bash
 yarn dev:web
-# Frontend runs on http://localhost:5174
+# Dashboard will start on http://localhost:5174
 ```
 
----
+## Monorepo Layout
 
-## ⚡ Concurrency Design
+```
+job-queue-dashboard/
+├── apps/
+│   ├── api/        NestJS — endpoints, service, repository, filters
+│   └── web/        React + Vite — UI, TanStack Query hooks, components
+└── packages/
+    └── shared/     JobStatus enum, Job interface, canTransition() — imported
+                    by both apps so the transition rules are never duplicated
+```
 
-### The Problem
-If two browser tabs open the same job and both click "→ Running" within milliseconds, both reads see `status=pending`, both validate the transition, and both writes succeed. The result is a phantom duplicate transition, skipping necessary logic.
+## API Endpoints
 
-### The Solution (Three-Layer Defense)
+| Method | Route | Description |
+|--------|-------|-------------|
+| POST | `/jobs` | Create job (accepts `Idempotency-Key` header) |
+| GET | `/jobs` | List jobs, optional `?status=` filter (10s cache) |
+| PATCH | `/jobs/:id/status` | Transition status, requires `version` in body |
+| DELETE | `/jobs/:id` | Delete job |
 
-**1. Upstash Redis Distributed Lock (`SET key NX PX 3000`)**
-The first request acquires `lock:job:{id}` and holds it for 3s. The second request sees the lock and immediately returns `409 Conflict`. 
-> **Why Upstash Redis?** Upstash provides Serverless Redis over HTTP. It is exceptionally fast, highly secure (REST-based meaning no exposed TCP ports, secured via Bearer tokens), and scales to zero automatically. It's the perfect serverless companion to avoid maintaining long-lived TCP connections, avoiding connection pool exhaustion during high concurrency bursts.
+## Concurrency Design
 
-**2. Optimistic Locking (`version` column)**
-The update safely checks the version:
+This is the main thing worth explaining.
+
+### The problem
+
+Two browser tabs open the same job and both click "→ Running" within milliseconds. Without any guard, both reads see `status=pending`, both validate the transition, and both writes succeed. The result is a phantom duplicate transition — or worse, a running → running → completed path that skips `failed` handling.
+
+### What we do
+
+Three layers, each catching different failure modes:
+
+**1. Redis distributed lock (`SET key NX PX 3000`)**
+
+The first request to arrive acquires `lock:job:{id}` and holds it for 3s. The second request sees the lock is held and immediately returns `409` — it doesn't even reach the DB. This handles the "two tabs clicking at the exact same millisecond" case.
+
+Why not `SELECT FOR UPDATE`? It works, but it holds a DB connection open for the lock duration. Under load, connection pool exhaustion becomes the bottleneck. The Redis lock is cheaper and releases the DB connection immediately.
+
+**2. Optimistic locking (`version` column)**
+
+The client always sends the `version` it last saw. The update does:
+
 ```sql
 UPDATE jobs SET status = $1, version = version + 1 WHERE id = $2 AND version = $3
 ```
-If `version` doesn't match, zero rows are affected → `409 Conflict`. This catches race conditions if the Redis lock is bypassed or expires.
+
+If `version` doesn't match (meaning someone else already updated between our read and write), zero rows are affected → `409 Conflict`. This catches the case where the Redis lock degraded gracefully (Upstash unreachable) or where a direct `curl` call bypasses the lock.
 
 **3. Prisma `$transaction`**
-The version check and the write happen inside a single atomic database transaction.
 
----
+The version check and the write are inside a single transaction, so there's no window between "check if version matches" and "write the new status."
 
-## 🔒 Production-Ready Improvement
+### What happens with a direct curl/Postman call?
 
-> **Assignment Prompt:** *Add one small improvement that you think would make this system more production-ready. Explain why you chose it.*
+All three layers run server-side. The state machine check (`canTransition`) is enforced in the service, not the controller and definitely not the frontend. If you send `PATCH /jobs/:id/status` with `{"status":"running","version":1}` directly, you get the exact same validation as the UI. The frontend's "only show valid buttons" behavior is a UX nicety, not a security boundary.
 
-### Improvement Added: Enterprise Security Hardening (Helmet, Strict CORS, & Rate Limiting)
+### What we'd do at scale
 
-While the core functionality of the job queue works perfectly, exposing a raw NestJS API directly to the internet is dangerous. I added a trio of security improvements to make the backend genuinely production-ready:
+At larger scale, the `status` column approach has a ceiling. A dedicated job queue (BullMQ, Temporal) provides retry logic, dead-letter queues, priority, rate limiting, and proper concurrency primitives out of the box. The current design is a reasonable starting point that could be migrated later: the state machine logic in `packages/shared` would move into a BullMQ processor, and the `status` column becomes a denormalized read-replica updated by the queue.
 
-1. **Helmet**: Automatically injects 14+ crucial HTTP security headers (like `X-Frame-Options` to prevent clickjacking, `Strict-Transport-Security` to enforce HTTPS, and `X-XSS-Protection`).
-2. **Strict CORS**: Instead of `app.enableCors()` allowing all origins, CORS is now strictly bound to the `FRONTEND_URL` environment variable in production, ensuring malicious websites cannot make unauthorized cross-origin requests to the API.
-3. **Throttler (Rate Limiting)**: Configured `@nestjs/throttler` to cap traffic at 100 requests per minute per IP. 
+## Caching
 
-**Why I chose this:** State machines and concurrency locks prevent *accidental* system failure, but security headers and rate limits prevent *malicious* system failure (like DDoS attacks or Cross-Site Scripting). This small improvement takes the app from a "local prototype" to a resilient, production-grade service that can safely be deployed to a public URL.
+`GET /jobs` (and `?status=` variants) are cached in Upstash Redis for 10 seconds per key. On any create, update, or delete, we bust all `jobs:list:*` keys. Simple, predictable. The alternative — a single version tag that gets incremented — trades a DEL for a GET + SET and isn't obviously better for a list this size.
 
----
+If Upstash is unreachable, the cache is skipped and the request hits Postgres directly. No `500`s.
 
-## 🐳 Deployment (Docker & Vercel)
+## Bonus: Idempotency Keys
 
-### Backend (Docker / Render / Railway)
-A `Dockerfile` is included in the root directory designed for this monorepo. It correctly builds the shared package, generates the Prisma client, and compiles the NestJS API.
+`POST /jobs` accepts an `Idempotency-Key` header. If the same key is sent twice (network retry, double-submit), the second call returns the cached result from the first call without creating a duplicate job. Keys are cached in Redis for 24 hours.
 
-### Frontend (Vercel)
-The Vite frontend can be deployed directly to Vercel. Make sure to set the `VITE_API_URL` environment variable to point to your deployed backend URL.
+The frontend sends a per-form-open UUID as the idempotency key, so hitting "Create" twice in quick succession produces exactly one job.
 
-*(Note: Vercel caches `node_modules`. To deploy the API to Vercel, the `build` script in `apps/api/package.json` was updated to explicitly run `prisma generate` to prevent 500 errors).*
+```bash
+# Demo
+curl -X POST http://localhost:3000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: my-unique-key-123" \
+  -d '{"title":"Test job","type":"demo"}'
 
----
+# Identical response, no new row created:
+curl -X POST http://localhost:3000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: my-unique-key-123" \
+  -d '{"title":"Test job","type":"demo"}'
+```
 
-## 🔁 Bonus: Idempotency Keys
+## Production Deployment Scope (VPS)
 
-`POST /jobs` accepts an `Idempotency-Key` header. If the same key is sent twice (e.g., a network retry), the second call returns the cached result without creating a duplicate job. Keys are cached securely in Redis for 24 hours.
+To deploy this application to a production Virtual Private Server (VPS) like AWS EC2, DigitalOcean Droplet, or Hetzner:
+
+### 1. Process Management (PM2)
+Use PM2 to run both the NestJS backend and the Vite static server (or serve frontend via Nginx directly).
+```bash
+# Start backend
+pm2 start dist/main.js --name api-server
+
+# For frontend, build it first
+yarn workspace web build
+# Serve static files with PM2 or Nginx
+```
+
+### 2. Reverse Proxy (Nginx)
+Configure Nginx to route traffic to your frontend and backend securely, handling SSL termination.
+
+```nginx
+server {
+    listen 80;
+    server_name yourdomain.com;
+
+    # Route /api to NestJS backend
+    location /api/ {
+        proxy_pass http://localhost:3000/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+        
+        # Forward Proxy / Real IP headers
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Serve React Frontend directly
+    location / {
+        root /path/to/job-queue-dashboard/apps/web/dist;
+        index index.html index.htm;
+        try_files $uri $uri/ /index.html;
+    }
+}
+```
+
+### 3. Production Security Features
+- **Helmet**: Adds 14+ HTTP security headers (X-Frame-Options, X-XSS-Protection, Strict-Transport-Security, etc.) to the NestJS API.
+- **CORS**: Configured in `main.ts` to only allow requests from the designated frontend production domain.
+- **Rate Limiting**: `@nestjs/throttler` is installed and configured in `app.module.ts` to limit abuse (100 requests / minute / IP).
+- **SSL/TLS**: Use Let's Encrypt / Certbot on the Nginx reverse proxy to secure all traffic.
+
+## Assumptions and Trade-offs
+
+- The `version` field is exposed to the client and required in `PATCH` bodies. A wrapping layer could hide it, but for this scope it's a clean contract.
+- Redis keys expire naturally; we also eagerly DEL on writes to avoid serving stale data within the 10s window.
+- No auth. Adding JWT/API key auth would be the first thing in a real production system.
+- Migrations are committed. `db push` is faster to iterate but doesn't give you a migration history — that matters when you have multiple environments.
+
+## What I'd Improve with More Time
+
+- Unit tests for the state machine and the concurrency path (version conflict + lock conflict)
+- WebSocket or SSE for real-time status updates instead of polling
+- Pagination for the job list
+- Proper structured logging (pino) with request IDs
+- Auth (JWT) on all write endpoints
