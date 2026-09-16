@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "yarn workspace shared build && nest build",
+    "build": "yarn workspace shared build && prisma generate && nest build",
     "start:dev": "node -e \"const {execSync}=require('child_process');execSync('nest build',{stdio:'inherit'});require('./dist/main')\"",
     "start:watch": "nest start --watch",
     "start:prod": "node dist/main"
